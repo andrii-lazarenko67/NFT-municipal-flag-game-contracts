@@ -5,132 +5,190 @@ import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
  * @title MunicipalFlagNFT
- * @dev ERC721 contract for Municipal Flag NFT Game
+ * @author Municipal Flag NFT Game
+ * @notice ERC721 contract for Municipal Flag NFT Game on Polygon Amoy
+ * @dev Implements the dual-NFT flag system with multi-NFT support and discount tiers
  *
- * MULTI-NFT FEATURE DOCUMENTATION:
- * ================================
- * This contract supports flags that require multiple NFTs to obtain.
+ * KEY FEATURES:
+ * =============
+ * 1. FLAG PAIR SYSTEM: Each flag has two NFTs - First (free claim) and Second (purchase)
+ * 2. MULTI-NFT FLAGS: Some flags require multiple NFTs (1-10) to complete
+ * 3. DISCOUNT TIERS: Plus (50%) and Premium (75%) discounts on Standard flags
+ * 4. IPFS METADATA: Each token links to IPFS-hosted metadata via tokenURI
  *
- * Design Decision: We implemented "grouped NFTs" (Solution B) rather than
- * fragmenting NFTs. This means:
- * - nftsRequired=1: Standard flag, user claims 1 first NFT and purchases 1 second NFT
- * - nftsRequired=3: Grouped flag, user must claim/purchase 3x the normal amount
+ * GAME FLOW:
+ * ==========
+ * 1. Admin registers flags with category, price, and nftsRequired
+ * 2. User claims first NFT(s) for free (shows interest)
+ * 3. User purchases second NFT(s) to complete the pair
+ * 4. Completing Plus/Premium flags grants permanent discounts
  *
- * The grouping is handled by:
- * 1. Storing nftsRequired in the FlagPair struct
- * 2. Minting multiple tokens in a single transaction (claimFirstNFTs, purchaseSecondNFTs)
- * 3. Total price = basePrice * nftsRequired
- *
- * Why Grouping over Fragmentation:
- * - Simpler implementation (no fractional ownership)
- * - Standard ERC721 compatibility (each token is whole)
- * - Clear user experience (you need X NFTs to complete)
- *
- * Each flag has a pair of NFTs:
- * - First NFT(s): Free to claim (shows interest)
- * - Second NFT(s): Purchased to complete the pair
- *
- * Flag Categories:
- * - Standard (0): No discounts
- * - Plus (1): 50% discount on future Standard purchases
- * - Premium (2): 75% permanent discount on Standard purchases
+ * MULTI-NFT IMPLEMENTATION:
+ * =========================
+ * - nftsRequired=1: Standard single NFT flag
+ * - nftsRequired=3: Grouped flag requiring 3 NFTs to claim/purchase
+ * - All NFTs are minted in a single transaction for gas efficiency
+ * - Total price = basePrice × nftsRequired
  */
-contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable {
+contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable, ReentrancyGuard {
     using Strings for uint256;
+
+    // =============================================================================
+    // CONSTANTS
+    // =============================================================================
+
+    /// @notice Category identifiers
+    uint8 public constant CATEGORY_STANDARD = 0;
+    uint8 public constant CATEGORY_PLUS = 1;
+    uint8 public constant CATEGORY_PREMIUM = 2;
+
+    /// @notice Discount rates in basis points (10000 = 100%)
+    uint256 public constant PLUS_DISCOUNT_BPS = 5000;     // 50% discount
+    uint256 public constant PREMIUM_DISCOUNT_BPS = 7500;  // 75% discount
+    uint256 public constant BASIS_POINTS = 10000;
+
+    /// @notice Maximum NFTs that can be required per flag
+    uint8 public constant MAX_NFTS_REQUIRED = 10;
 
     // =============================================================================
     // STATE VARIABLES
     // =============================================================================
 
+    /// @notice Counter for generating unique token IDs
     uint256 private _tokenIdCounter;
+
+    /// @notice Base URI for token metadata (IPFS gateway)
     string private _baseTokenURI;
 
-    // Flag categories
-    uint8 public constant CATEGORY_STANDARD = 0;
-    uint8 public constant CATEGORY_PLUS = 1;
-    uint8 public constant CATEGORY_PREMIUM = 2;
-
-    // Discount percentages (in basis points, 10000 = 100%)
-    uint256 public constant PLUS_DISCOUNT = 5000;     // 50%
-    uint256 public constant PREMIUM_DISCOUNT = 7500;  // 75%
-
     /**
-     * @dev Flag pair structure with multi-NFT support
-     *
-     * MULTI-NFT FIELDS:
-     * - nftsRequired: Number of NFTs needed to obtain this flag (1 = single, 3 = grouped)
-     * - firstTokenIds: Array of token IDs for first NFTs (length = nftsRequired)
-     * - secondTokenIds: Array of token IDs for second NFTs (length = nftsRequired)
-     * - firstMintedCount: How many first NFTs have been claimed
-     * - secondMintedCount: How many second NFTs have been purchased
+     * @notice Flag pair structure with multi-NFT support
+     * @dev Stores all data related to a flag's NFT pair
      */
     struct FlagPair {
-        uint256 flagId;
-        uint256 firstTokenId;      // First token ID (for single NFT compatibility)
-        uint256 secondTokenId;     // Second token ID (for single NFT compatibility)
-        bool firstMinted;          // All first NFTs claimed
-        bool secondMinted;         // All second NFTs purchased
-        bool pairComplete;
-        uint8 category;
-        uint256 price;             // Price per NFT
-        uint8 nftsRequired;        // MULTI-NFT: Number of NFTs required (1 or 3)
-        uint8 firstMintedCount;    // MULTI-NFT: Count of first NFTs claimed
-        uint8 secondMintedCount;   // MULTI-NFT: Count of second NFTs purchased
+        uint256 flagId;           // Unique flag identifier (matches database)
+        uint256 firstTokenId;     // First minted token ID (for single NFT compatibility)
+        uint256 secondTokenId;    // First second token ID (for single NFT compatibility)
+        address firstOwner;       // Address that claimed first NFT(s)
+        address secondOwner;      // Address that purchased second NFT(s)
+        bool firstMinted;         // True when all first NFTs are claimed
+        bool secondMinted;        // True when all second NFTs are purchased
+        bool pairComplete;        // True when pair is fully complete
+        uint8 category;           // 0=Standard, 1=Plus, 2=Premium
+        uint256 price;            // Price per NFT in wei
+        uint8 nftsRequired;       // Number of NFTs required (1-10)
+        uint8 firstMintedCount;   // Count of first NFTs claimed
+        uint8 secondMintedCount;  // Count of second NFTs purchased
+        string metadataHash;      // SHA-256 hash for integrity verification
     }
 
-    // Mappings
+    /// @notice Mapping from flag ID to FlagPair data
     mapping(uint256 => FlagPair) public flagPairs;
+
+    /// @notice Mapping from token ID to flag ID
     mapping(uint256 => uint256) public tokenToFlag;
+
+    /// @notice Track if token is first or second NFT (true = first, false = second)
+    mapping(uint256 => bool) public isFirstNFT;
+
+    /// @notice Addresses that have Plus discount
     mapping(address => bool) public hasPlus;
+
+    /// @notice Addresses that have Premium discount
     mapping(address => bool) public hasPremium;
 
-    // MULTI-NFT: Track all token IDs for each flag
-    mapping(uint256 => uint256[]) public flagFirstTokenIds;
-    mapping(uint256 => uint256[]) public flagSecondTokenIds;
+    /// @notice All first token IDs for each flag (multi-NFT)
+    mapping(uint256 => uint256[]) private _flagFirstTokenIds;
 
-    // Track registered flags
+    /// @notice All second token IDs for each flag (multi-NFT)
+    mapping(uint256 => uint256[]) private _flagSecondTokenIds;
+
+    /// @notice Array of all registered flag IDs
     uint256[] private _registeredFlagIds;
+
+    /// @notice Mapping to track if a flag ID exists
+    mapping(uint256 => bool) private _flagExists;
 
     // =============================================================================
     // EVENTS
     // =============================================================================
 
+    /// @notice Emitted when a new flag is registered
     event FlagRegistered(
         uint256 indexed flagId,
         uint8 category,
         uint256 price,
-        uint8 nftsRequired  // MULTI-NFT: Added nftsRequired to event
+        uint8 nftsRequired
     );
 
+    /// @notice Emitted when first NFT(s) are claimed
     event FirstNFTClaimed(
         uint256 indexed flagId,
         uint256 indexed tokenId,
         address indexed claimer,
-        uint8 claimCount  // MULTI-NFT: Which claim number this is (1, 2, or 3)
+        uint8 claimNumber
     );
 
+    /// @notice Emitted when second NFT(s) are purchased
     event SecondNFTPurchased(
         uint256 indexed flagId,
         uint256 indexed tokenId,
         address indexed buyer,
         uint256 pricePaid,
-        uint8 purchaseCount  // MULTI-NFT: Which purchase number this is
+        uint8 purchaseNumber
     );
 
-    event PairCompleted(uint256 indexed flagId);
+    /// @notice Emitted when a flag pair is completed
+    event PairCompleted(
+        uint256 indexed flagId,
+        address indexed completedBy
+    );
 
+    /// @notice Emitted when discount status changes
+    event DiscountGranted(
+        address indexed user,
+        uint8 discountType  // 1=Plus, 2=Premium
+    );
+
+    /// @notice Emitted when base URI is updated
     event BaseURIUpdated(string newBaseURI);
 
+    /// @notice Emitted when funds are withdrawn
     event Withdrawal(address indexed to, uint256 amount);
+
+    /// @notice Emitted when flag metadata hash is set
+    event MetadataHashSet(uint256 indexed flagId, string metadataHash);
+
+    // =============================================================================
+    // ERRORS
+    // =============================================================================
+
+    error FlagNotRegistered(uint256 flagId);
+    error FlagAlreadyRegistered(uint256 flagId);
+    error InvalidCategory(uint8 category);
+    error InvalidPrice();
+    error InvalidNftsRequired(uint8 nftsRequired);
+    error FirstNFTAlreadyClaimed(uint256 flagId);
+    error SecondNFTAlreadyPurchased(uint256 flagId);
+    error FirstNFTNotClaimed(uint256 flagId);
+    error InsufficientPayment(uint256 required, uint256 sent);
+    error NoBalanceToWithdraw();
+    error WithdrawalFailed();
+    error RefundFailed();
+    error ArrayLengthMismatch();
 
     // =============================================================================
     // CONSTRUCTOR
     // =============================================================================
 
+    /**
+     * @notice Deploy the Municipal Flag NFT contract
+     * @param baseURI Base URI for token metadata (e.g., IPFS gateway)
+     */
     constructor(
         string memory baseURI
     ) ERC721("Municipal Flag NFT", "MFLAG") Ownable(msg.sender) {
@@ -142,17 +200,11 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     // =============================================================================
 
     /**
-     * @dev Register a new flag for the game with multi-NFT support
-     * @param flagId Unique identifier for the flag
+     * @notice Register a new flag for the game
+     * @param flagId Unique identifier for the flag (matches database)
      * @param category Flag category (0=Standard, 1=Plus, 2=Premium)
      * @param price Price in wei for each second NFT
-     * @param nftsRequired Number of NFTs required to obtain this flag (1 or 3)
-     *
-     * MULTI-NFT DOCUMENTATION:
-     * When nftsRequired > 1, the user must:
-     * 1. Claim nftsRequired first NFTs (free)
-     * 2. Purchase nftsRequired second NFTs (price each)
-     * Total cost = price * nftsRequired
+     * @param nftsRequired Number of NFTs required to complete this flag (1-10)
      */
     function registerFlag(
         uint256 flagId,
@@ -160,15 +212,19 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
         uint256 price,
         uint8 nftsRequired
     ) external onlyOwner {
-        require(flagPairs[flagId].flagId == 0, "Flag already registered");
-        require(category <= CATEGORY_PREMIUM, "Invalid category");
-        require(price > 0, "Price must be greater than 0");
-        require(nftsRequired > 0 && nftsRequired <= 10, "NFTs required must be 1-10");
+        if (_flagExists[flagId]) revert FlagAlreadyRegistered(flagId);
+        if (category > CATEGORY_PREMIUM) revert InvalidCategory(category);
+        if (price == 0) revert InvalidPrice();
+        if (nftsRequired == 0 || nftsRequired > MAX_NFTS_REQUIRED) {
+            revert InvalidNftsRequired(nftsRequired);
+        }
 
         flagPairs[flagId] = FlagPair({
             flagId: flagId,
             firstTokenId: 0,
             secondTokenId: 0,
+            firstOwner: address(0),
+            secondOwner: address(0),
             firstMinted: false,
             secondMinted: false,
             pairComplete: false,
@@ -176,30 +232,37 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
             price: price,
             nftsRequired: nftsRequired,
             firstMintedCount: 0,
-            secondMintedCount: 0
+            secondMintedCount: 0,
+            metadataHash: ""
         });
 
+        _flagExists[flagId] = true;
         _registeredFlagIds.push(flagId);
 
         emit FlagRegistered(flagId, category, price, nftsRequired);
     }
 
     /**
-     * @dev Register a flag with default nftsRequired=1 (backward compatible)
+     * @notice Register a flag with default nftsRequired=1 (backward compatible)
+     * @param flagId Unique identifier for the flag
+     * @param category Flag category (0=Standard, 1=Plus, 2=Premium)
+     * @param price Price in wei for the second NFT
      */
     function registerFlagSimple(
         uint256 flagId,
         uint8 category,
         uint256 price
     ) external onlyOwner {
-        require(flagPairs[flagId].flagId == 0, "Flag already registered");
-        require(category <= CATEGORY_PREMIUM, "Invalid category");
-        require(price > 0, "Price must be greater than 0");
+        if (_flagExists[flagId]) revert FlagAlreadyRegistered(flagId);
+        if (category > CATEGORY_PREMIUM) revert InvalidCategory(category);
+        if (price == 0) revert InvalidPrice();
 
         flagPairs[flagId] = FlagPair({
             flagId: flagId,
             firstTokenId: 0,
             secondTokenId: 0,
+            firstOwner: address(0),
+            secondOwner: address(0),
             firstMinted: false,
             secondMinted: false,
             pairComplete: false,
@@ -207,16 +270,18 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
             price: price,
             nftsRequired: 1,
             firstMintedCount: 0,
-            secondMintedCount: 0
+            secondMintedCount: 0,
+            metadataHash: ""
         });
 
+        _flagExists[flagId] = true;
         _registeredFlagIds.push(flagId);
 
         emit FlagRegistered(flagId, category, price, 1);
     }
 
     /**
-     * @dev Batch register multiple flags with multi-NFT support
+     * @notice Batch register multiple flags
      * @param flagIds Array of flag IDs
      * @param categories Array of categories
      * @param prices Array of prices
@@ -228,23 +293,26 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
         uint256[] calldata prices,
         uint8[] calldata nftsRequiredArr
     ) external onlyOwner {
-        require(
-            flagIds.length == categories.length &&
-            flagIds.length == prices.length &&
-            flagIds.length == nftsRequiredArr.length,
-            "Arrays length mismatch"
-        );
+        if (
+            flagIds.length != categories.length ||
+            flagIds.length != prices.length ||
+            flagIds.length != nftsRequiredArr.length
+        ) revert ArrayLengthMismatch();
 
         for (uint256 i = 0; i < flagIds.length; i++) {
-            require(flagPairs[flagIds[i]].flagId == 0, "Flag already registered");
-            require(categories[i] <= CATEGORY_PREMIUM, "Invalid category");
-            require(prices[i] > 0, "Price must be greater than 0");
-            require(nftsRequiredArr[i] > 0 && nftsRequiredArr[i] <= 10, "NFTs required must be 1-10");
+            if (_flagExists[flagIds[i]]) revert FlagAlreadyRegistered(flagIds[i]);
+            if (categories[i] > CATEGORY_PREMIUM) revert InvalidCategory(categories[i]);
+            if (prices[i] == 0) revert InvalidPrice();
+            if (nftsRequiredArr[i] == 0 || nftsRequiredArr[i] > MAX_NFTS_REQUIRED) {
+                revert InvalidNftsRequired(nftsRequiredArr[i]);
+            }
 
             flagPairs[flagIds[i]] = FlagPair({
                 flagId: flagIds[i],
                 firstTokenId: 0,
                 secondTokenId: 0,
+                firstOwner: address(0),
+                secondOwner: address(0),
                 firstMinted: false,
                 secondMinted: false,
                 pairComplete: false,
@@ -252,9 +320,11 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
                 price: prices[i],
                 nftsRequired: nftsRequiredArr[i],
                 firstMintedCount: 0,
-                secondMintedCount: 0
+                secondMintedCount: 0,
+                metadataHash: ""
             });
 
+            _flagExists[flagIds[i]] = true;
             _registeredFlagIds.push(flagIds[i]);
 
             emit FlagRegistered(flagIds[i], categories[i], prices[i], nftsRequiredArr[i]);
@@ -262,8 +332,66 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     }
 
     /**
-     * @dev Update the base URI for token metadata
-     * @param newBaseURI New base URI
+     * @notice Batch register multiple flags with nftsRequired=1 (simpler)
+     * @param flagIds Array of flag IDs
+     * @param categories Array of categories
+     * @param prices Array of prices
+     */
+    function batchRegisterFlagsSimple(
+        uint256[] calldata flagIds,
+        uint8[] calldata categories,
+        uint256[] calldata prices
+    ) external onlyOwner {
+        if (flagIds.length != categories.length || flagIds.length != prices.length) {
+            revert ArrayLengthMismatch();
+        }
+
+        for (uint256 i = 0; i < flagIds.length; i++) {
+            if (_flagExists[flagIds[i]]) revert FlagAlreadyRegistered(flagIds[i]);
+            if (categories[i] > CATEGORY_PREMIUM) revert InvalidCategory(categories[i]);
+            if (prices[i] == 0) revert InvalidPrice();
+
+            flagPairs[flagIds[i]] = FlagPair({
+                flagId: flagIds[i],
+                firstTokenId: 0,
+                secondTokenId: 0,
+                firstOwner: address(0),
+                secondOwner: address(0),
+                firstMinted: false,
+                secondMinted: false,
+                pairComplete: false,
+                category: categories[i],
+                price: prices[i],
+                nftsRequired: 1,
+                firstMintedCount: 0,
+                secondMintedCount: 0,
+                metadataHash: ""
+            });
+
+            _flagExists[flagIds[i]] = true;
+            _registeredFlagIds.push(flagIds[i]);
+
+            emit FlagRegistered(flagIds[i], categories[i], prices[i], 1);
+        }
+    }
+
+    /**
+     * @notice Set metadata hash for a flag (for integrity verification)
+     * @param flagId The flag ID
+     * @param metadataHash SHA-256 hash of the metadata
+     */
+    function setMetadataHash(
+        uint256 flagId,
+        string calldata metadataHash
+    ) external onlyOwner {
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
+        flagPairs[flagId].metadataHash = metadataHash;
+        emit MetadataHashSet(flagId, metadataHash);
+    }
+
+    /**
+     * @notice Update the base URI for token metadata
+     * @param newBaseURI New base URI (e.g., new IPFS gateway)
      */
     function setBaseURI(string memory newBaseURI) external onlyOwner {
         _baseTokenURI = newBaseURI;
@@ -271,46 +399,44 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     }
 
     /**
-     * @dev Withdraw contract balance
+     * @notice Withdraw contract balance to owner
      */
-    function withdraw() external onlyOwner {
+    function withdraw() external onlyOwner nonReentrant {
         uint256 balance = address(this).balance;
-        require(balance > 0, "No balance to withdraw");
+        if (balance == 0) revert NoBalanceToWithdraw();
 
         (bool success, ) = payable(owner()).call{value: balance}("");
-        require(success, "Withdrawal failed");
+        if (!success) revert WithdrawalFailed();
 
         emit Withdrawal(owner(), balance);
     }
 
     // =============================================================================
-    // PUBLIC FUNCTIONS - MULTI-NFT SUPPORT
+    // PUBLIC MINTING FUNCTIONS
     // =============================================================================
 
     /**
-     * @dev Claim the first NFT(s) of a flag pair (free)
+     * @notice Claim the first NFT(s) of a flag pair (free)
      * @param flagId The flag ID to claim
-     *
-     * MULTI-NFT BEHAVIOR:
-     * - For single NFT flags (nftsRequired=1): Claims 1 NFT
-     * - For grouped NFT flags (nftsRequired=3): Claims all 3 NFTs in one transaction
-     *
-     * All first NFTs must be claimed before any second NFTs can be purchased.
+     * @dev Mints all required first NFTs in a single transaction
      */
-    function claimFirstNFT(uint256 flagId) external {
+    function claimFirstNFT(uint256 flagId) external nonReentrant {
         FlagPair storage pair = flagPairs[flagId];
 
-        require(pair.flagId != 0, "Flag not registered");
-        require(!pair.firstMinted, "First NFT(s) already claimed");
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
+        if (pair.firstMinted) revert FirstNFTAlreadyClaimed(flagId);
 
-        // MULTI-NFT: Mint all required first NFTs
+        pair.firstOwner = msg.sender;
+
+        // Mint all required first NFTs
         for (uint8 i = 0; i < pair.nftsRequired; i++) {
             _tokenIdCounter++;
             uint256 newTokenId = _tokenIdCounter;
 
             _safeMint(msg.sender, newTokenId);
             tokenToFlag[newTokenId] = flagId;
-            flagFirstTokenIds[flagId].push(newTokenId);
+            isFirstNFT[newTokenId] = true;
+            _flagFirstTokenIds[flagId].push(newTokenId);
 
             // Store first token ID for backward compatibility
             if (i == 0) {
@@ -325,36 +451,36 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     }
 
     /**
-     * @dev Purchase the second NFT(s) of a flag pair
+     * @notice Purchase the second NFT(s) of a flag pair
      * @param flagId The flag ID to purchase
-     *
-     * MULTI-NFT BEHAVIOR:
-     * - For single NFT flags: Purchases 1 NFT at base price
-     * - For grouped NFT flags: Purchases all NFTs, total price = basePrice * nftsRequired
-     *
-     * PRICING:
-     * Total cost = getPriceWithDiscount(flagId, buyer) * nftsRequired
+     * @dev Mints all required second NFTs and applies discounts
      */
-    function purchaseSecondNFT(uint256 flagId) external payable {
+    function purchaseSecondNFT(uint256 flagId) external payable nonReentrant {
         FlagPair storage pair = flagPairs[flagId];
 
-        require(pair.flagId != 0, "Flag not registered");
-        require(pair.firstMinted, "First NFT(s) must be claimed first");
-        require(!pair.secondMinted, "Second NFT(s) already purchased");
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
+        if (!pair.firstMinted) revert FirstNFTNotClaimed(flagId);
+        if (pair.secondMinted) revert SecondNFTAlreadyPurchased(flagId);
 
-        // MULTI-NFT: Calculate total price for all required NFTs
+        // Calculate total price with discount
         uint256 pricePerNFT = getPriceWithDiscount(flagId, msg.sender);
         uint256 totalPrice = pricePerNFT * pair.nftsRequired;
-        require(msg.value >= totalPrice, "Insufficient payment");
 
-        // MULTI-NFT: Mint all required second NFTs
+        if (msg.value < totalPrice) {
+            revert InsufficientPayment(totalPrice, msg.value);
+        }
+
+        pair.secondOwner = msg.sender;
+
+        // Mint all required second NFTs
         for (uint8 i = 0; i < pair.nftsRequired; i++) {
             _tokenIdCounter++;
             uint256 newTokenId = _tokenIdCounter;
 
             _safeMint(msg.sender, newTokenId);
             tokenToFlag[newTokenId] = flagId;
-            flagSecondTokenIds[flagId].push(newTokenId);
+            isFirstNFT[newTokenId] = false;
+            _flagSecondTokenIds[flagId].push(newTokenId);
 
             // Store first second token ID for backward compatibility
             if (i == 0) {
@@ -368,20 +494,33 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
         pair.secondMinted = true;
         pair.pairComplete = true;
 
-        // Update discount eligibility based on category
-        if (pair.category == CATEGORY_PLUS && !hasPlus[msg.sender]) {
-            hasPlus[msg.sender] = true;
-        } else if (pair.category == CATEGORY_PREMIUM && !hasPremium[msg.sender]) {
-            hasPremium[msg.sender] = true;
-        }
+        // Grant discount based on category
+        _grantDiscount(msg.sender, pair.category);
 
         // Refund excess payment
         if (msg.value > totalPrice) {
             (bool refundSuccess, ) = payable(msg.sender).call{value: msg.value - totalPrice}("");
-            require(refundSuccess, "Refund failed");
+            if (!refundSuccess) revert RefundFailed();
         }
 
-        emit PairCompleted(flagId);
+        emit PairCompleted(flagId, msg.sender);
+    }
+
+    // =============================================================================
+    // INTERNAL FUNCTIONS
+    // =============================================================================
+
+    /**
+     * @dev Grant discount to user based on flag category
+     */
+    function _grantDiscount(address user, uint8 category) internal {
+        if (category == CATEGORY_PLUS && !hasPlus[user]) {
+            hasPlus[user] = true;
+            emit DiscountGranted(user, CATEGORY_PLUS);
+        } else if (category == CATEGORY_PREMIUM && !hasPremium[user]) {
+            hasPremium[user] = true;
+            emit DiscountGranted(user, CATEGORY_PREMIUM);
+        }
     }
 
     // =============================================================================
@@ -389,43 +528,83 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     // =============================================================================
 
     /**
-     * @dev Get flag pair information
+     * @notice Get complete flag pair information
      * @param flagId The flag ID
-     * @return FlagPair struct
+     * @return FlagPair struct with all data
      */
     function getFlagPair(uint256 flagId) external view returns (FlagPair memory) {
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
         return flagPairs[flagId];
     }
 
     /**
-     * @dev Get all first token IDs for a flag (MULTI-NFT)
+     * @notice Check if a flag is registered
+     * @param flagId The flag ID
+     * @return True if registered
+     */
+    function isFlagRegistered(uint256 flagId) external view returns (bool) {
+        return _flagExists[flagId];
+    }
+
+    /**
+     * @notice Get all first token IDs for a flag
      * @param flagId The flag ID
      * @return Array of token IDs
      */
     function getFirstTokenIds(uint256 flagId) external view returns (uint256[] memory) {
-        return flagFirstTokenIds[flagId];
+        return _flagFirstTokenIds[flagId];
     }
 
     /**
-     * @dev Get all second token IDs for a flag (MULTI-NFT)
+     * @notice Get all second token IDs for a flag
      * @param flagId The flag ID
      * @return Array of token IDs
      */
     function getSecondTokenIds(uint256 flagId) external view returns (uint256[] memory) {
-        return flagSecondTokenIds[flagId];
+        return _flagSecondTokenIds[flagId];
     }
 
     /**
-     * @dev Get number of NFTs required for a flag (MULTI-NFT)
+     * @notice Get number of NFTs required for a flag
      * @param flagId The flag ID
      * @return Number of NFTs required
      */
     function getNftsRequired(uint256 flagId) external view returns (uint8) {
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
         return flagPairs[flagId].nftsRequired;
     }
 
     /**
-     * @dev Calculate total price for all NFTs with discount
+     * @notice Calculate price per NFT with discount for a buyer
+     * @param flagId The flag ID
+     * @param buyer The buyer address
+     * @return Final price per NFT in wei after discount
+     */
+    function getPriceWithDiscount(
+        uint256 flagId,
+        address buyer
+    ) public view returns (uint256) {
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
+
+        FlagPair memory pair = flagPairs[flagId];
+        uint256 basePrice = pair.price;
+
+        // Only apply discounts to Standard category flags
+        if (pair.category == CATEGORY_STANDARD) {
+            if (hasPremium[buyer]) {
+                // 75% discount = pay 25%
+                return basePrice - (basePrice * PREMIUM_DISCOUNT_BPS / BASIS_POINTS);
+            } else if (hasPlus[buyer]) {
+                // 50% discount = pay 50%
+                return basePrice - (basePrice * PLUS_DISCOUNT_BPS / BASIS_POINTS);
+            }
+        }
+
+        return basePrice;
+    }
+
+    /**
+     * @notice Calculate total price for all NFTs with discount
      * @param flagId The flag ID
      * @param buyer The buyer address
      * @return Total price for all required NFTs after discount
@@ -434,50 +613,20 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
         uint256 flagId,
         address buyer
     ) external view returns (uint256) {
-        FlagPair memory pair = flagPairs[flagId];
-        require(pair.flagId != 0, "Flag not registered");
-        return getPriceWithDiscount(flagId, buyer) * pair.nftsRequired;
+        if (!_flagExists[flagId]) revert FlagNotRegistered(flagId);
+        return getPriceWithDiscount(flagId, buyer) * flagPairs[flagId].nftsRequired;
     }
 
     /**
-     * @dev Calculate price per NFT with discount for a buyer
-     * @param flagId The flag ID
-     * @param buyer The buyer address
-     * @return Final price per NFT after discount
-     */
-    function getPriceWithDiscount(
-        uint256 flagId,
-        address buyer
-    ) public view returns (uint256) {
-        FlagPair memory pair = flagPairs[flagId];
-        require(pair.flagId != 0, "Flag not registered");
-
-        uint256 basePrice = pair.price;
-
-        // Only apply discounts to Standard category flags
-        if (pair.category == CATEGORY_STANDARD) {
-            if (hasPremium[buyer]) {
-                // 75% discount
-                return basePrice - (basePrice * PREMIUM_DISCOUNT / 10000);
-            } else if (hasPlus[buyer]) {
-                // 50% discount
-                return basePrice - (basePrice * PLUS_DISCOUNT / 10000);
-            }
-        }
-
-        return basePrice;
-    }
-
-    /**
-     * @dev Get total number of registered flags
-     * @return Total count
+     * @notice Get total number of registered flags
+     * @return Count of registered flags
      */
     function getTotalRegisteredFlags() external view returns (uint256) {
         return _registeredFlagIds.length;
     }
 
     /**
-     * @dev Get all registered flag IDs
+     * @notice Get all registered flag IDs
      * @return Array of flag IDs
      */
     function getRegisteredFlagIds() external view returns (uint256[] memory) {
@@ -485,34 +634,70 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     }
 
     /**
-     * @dev Check if user has Plus discount
+     * @notice Check if user has Plus discount
      * @param user Address to check
-     * @return bool
+     * @return True if user has Plus
      */
     function userHasPlus(address user) external view returns (bool) {
         return hasPlus[user];
     }
 
     /**
-     * @dev Check if user has Premium discount
+     * @notice Check if user has Premium discount
      * @param user Address to check
-     * @return bool
+     * @return True if user has Premium
      */
     function userHasPremium(address user) external view returns (bool) {
         return hasPremium[user];
     }
 
     /**
-     * @dev Get the flag ID for a token
+     * @notice Get the highest discount tier for a user
+     * @param user Address to check
+     * @return 0=None, 1=Plus, 2=Premium
+     */
+    function getUserDiscountTier(address user) external view returns (uint8) {
+        if (hasPremium[user]) return CATEGORY_PREMIUM;
+        if (hasPlus[user]) return CATEGORY_PLUS;
+        return 0;
+    }
+
+    /**
+     * @notice Get the flag ID for a token
      * @param tokenId The token ID
-     * @return Flag ID
+     * @return Flag ID that this token belongs to
      */
     function getFlagIdForToken(uint256 tokenId) external view returns (uint256) {
         return tokenToFlag[tokenId];
     }
 
+    /**
+     * @notice Check if a token is a first NFT or second NFT
+     * @param tokenId The token ID
+     * @return True if first NFT, false if second NFT
+     */
+    function isTokenFirstNFT(uint256 tokenId) external view returns (bool) {
+        return isFirstNFT[tokenId];
+    }
+
+    /**
+     * @notice Get total tokens minted
+     * @return Current token counter value
+     */
+    function getTotalTokensMinted() external view returns (uint256) {
+        return _tokenIdCounter;
+    }
+
+    /**
+     * @notice Get contract balance
+     * @return Balance in wei
+     */
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
     // =============================================================================
-    // OVERRIDES
+    // ERC721 OVERRIDES
     // =============================================================================
 
     function _baseURI() internal view override returns (string memory) {
@@ -522,12 +707,16 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     function tokenURI(
         uint256 tokenId
     ) public view override(ERC721, ERC721URIStorage) returns (string memory) {
-        require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        // Check token exists
+        _requireOwned(tokenId);
 
         string memory baseURI = _baseURI();
-        return bytes(baseURI).length > 0
-            ? string(abi.encodePacked(baseURI, tokenId.toString(), ".json"))
-            : "";
+        if (bytes(baseURI).length == 0) {
+            return "";
+        }
+
+        // Format: baseURI/tokenId.json
+        return string(abi.encodePacked(baseURI, tokenId.toString(), ".json"));
     }
 
     function _update(
@@ -550,4 +739,11 @@ contract MunicipalFlagNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable
     ) public view override(ERC721, ERC721Enumerable, ERC721URIStorage) returns (bool) {
         return super.supportsInterface(interfaceId);
     }
+
+    // =============================================================================
+    // RECEIVE FUNCTION
+    // =============================================================================
+
+    /// @notice Allow contract to receive ETH/MATIC directly
+    receive() external payable {}
 }

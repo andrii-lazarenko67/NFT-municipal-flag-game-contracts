@@ -36,31 +36,36 @@ async function main() {
 
   // Generate flag data for 64 flags
   // Distribution: ~60% Standard, ~30% Plus, ~10% Premium
+  // nftsRequired: 1 for most, 3 for Premium flags (multi-NFT)
   const flagData = [];
 
   for (let i = 1; i <= 64; i++) {
-    let category, price;
+    let category, price, nftsRequired;
 
-    // Town Hall flags (every 8th starting from 1) are Premium
+    // Town Hall flags (every 8th starting from 1) are Premium with multi-NFT
     if (i % 8 === 1) {
       category = CATEGORY_PREMIUM;
       price = PRICE_PREMIUM;
+      nftsRequired = 3;  // Premium flags require 3 NFTs
     }
     // Fire Station and Bridge flags are Plus
     else if (i % 8 === 2 || i % 8 === 7) {
       category = CATEGORY_PLUS;
       price = PRICE_PLUS;
+      nftsRequired = 1;
     }
     // Rest are Standard
     else {
       category = CATEGORY_STANDARD;
       price = PRICE_STANDARD;
+      nftsRequired = 1;
     }
 
     flagData.push({
       flagId: i,
       category: category,
       price: price,
+      nftsRequired: nftsRequired,
     });
   }
 
@@ -83,12 +88,13 @@ async function main() {
     const flagIds = batch.map((f) => f.flagId);
     const categories = batch.map((f) => f.category);
     const prices = batch.map((f) => f.price);
+    const nftsRequiredArr = batch.map((f) => f.nftsRequired);
 
     console.log(`\n📦 Registering batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(totalFlags / batchSize)}`);
     console.log(`   Flag IDs: ${flagIds[0]} - ${flagIds[flagIds.length - 1]}`);
 
     try {
-      const tx = await contract.batchRegisterFlags(flagIds, categories, prices);
+      const tx = await contract.batchRegisterFlags(flagIds, categories, prices, nftsRequiredArr);
       console.log(`   Transaction: ${tx.hash}`);
       await tx.wait();
       console.log(`   ✅ Batch registered successfully!`);
