@@ -78,8 +78,9 @@ async function main() {
     return;
   }
 
-  // Batch register flags (in groups of 20 to avoid gas limits)
-  const batchSize = 20;
+  // Batch register flags (in groups of 10 to avoid gas fee cap limits)
+  // Reduced from 20 to 10 to keep tx fees under the default 1 ether cap
+  const batchSize = 10;
   const totalFlags = flagData.length;
 
   for (let i = 0; i < totalFlags; i += batchSize) {
