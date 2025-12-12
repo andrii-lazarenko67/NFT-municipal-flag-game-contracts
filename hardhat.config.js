@@ -26,8 +26,6 @@ module.exports = {
       accounts: process.env.DEPLOYER_PRIVATE_KEY
         ? [process.env.DEPLOYER_PRIVATE_KEY]
         : [],
-      // Use low gas price to stay under 1 ether tx fee cap
-      // 5 gwei keeps deployment under 0.03 ETH even for large contracts
       gasPrice: "auto",
     },
   },
